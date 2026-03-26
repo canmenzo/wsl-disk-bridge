@@ -1,0 +1,6 @@
+*.exe
+*.obj
+*.pdb
+*.log
+nbd_output.log
+nbd_log.txt
