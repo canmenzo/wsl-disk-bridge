@@ -4,3 +4,4 @@
 *.log
 nbd_output.log
 nbd_log.txt
+test_disk.img

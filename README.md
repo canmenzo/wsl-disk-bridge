@@ -1,5 +1,6 @@
 # 🌉 WSL Disk Bridge
 
+[![build](https://github.com/canmenzo/wsl-disk-bridge/actions/workflows/build.yml/badge.svg)](https://github.com/canmenzo/wsl-disk-bridge/actions/workflows/build.yml)
 [![license](https://img.shields.io/github/license/canmenzo/wsl-disk-bridge)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%2B%20WSL2-0078D6?logo=windows&logoColor=white)
 ![C#](https://img.shields.io/badge/C%23-.NET%20Framework%204.x-512BD4?logo=dotnet&logoColor=white)
@@ -52,21 +53,18 @@ Get-Disk | Format-Table Number, FriendlyName, Size
 Get-Partition -DiskNumber 1 | Format-Table PartitionNumber, Offset, Size, Type
 ```
 
-Set the constants at the top of `nbd_server.cs`:
-
-```csharp
-const string DISK = @"\\.\PhysicalDrive1";      // your disk
-const long PART_OFFSET = 2148532224L;             // partition byte offset
-const long PART_SIZE   = 1998250384896L;          // partition size in bytes
-```
+Note the disk number and the partition's `Offset` and `Size` for the next step.
 
 **3. Compile and run the server** (PowerShell):
 
 ```powershell
 $csc = (Get-ChildItem "C:\Windows\Microsoft.NET\Framework64" -Recurse -Filter "csc.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
 & $csc /out:nbd_server.exe /platform:x64 /optimize+ nbd_server.cs
-Start-Process .\nbd_server.exe -Verb RunAs     # raw disk access needs admin
+# raw disk access needs admin; use your disk number, offset and size from step 2
+Start-Process .\nbd_server.exe -Verb RunAs -ArgumentList '--disk 1 --offset 2148532224 --size 1998250384896'
 ```
+
+Start WSL before the server so it can find the WSL network adapter to listen on.
 
 **4. Connect and mount from WSL2:**
 
@@ -84,10 +82,21 @@ sudo mount -t xfs -o ro,norecovery,nouuid /dev/nbd0 /mnt/linux
 
 **5. Clean up:** `sudo umount /mnt/linux && sudo nbd-client -d /dev/nbd0`, then close the server window.
 
-> ⚠️ The server listens on all interfaces on port 10809 with no authentication, so anyone who can reach that port can read the partition. Keep it blocked in Windows Firewall for anything but the WSL network, and stop the server when you're done.
+> ⚠️ There is no authentication: anyone who can reach port 10809 can read the partition. By default the server only listens on the WSL virtual adapter (or 127.0.0.1 if it can't find one), never on your LAN. Don't pass `--bind 0.0.0.0` unless you know why, and stop the server when you're done.
 
 ### ⚙️ Configuration
-All settings are constants at the top of `nbd_server.cs`: `DISK`, `PART_OFFSET`, `PART_SIZE`, `PORT` (default 10809) and `patchXfsFeatures` (default `true`, turned off automatically for ext4 and btrfs). The server writes a log to `nbd_server.log` next to the exe.
+Command-line options (`nbd_server.exe --help` lists them). Anything you leave out uses the defaults at the top of `nbd_server.cs`.
+
+| Option | Meaning |
+|---|---|
+| `--disk <N or path>` | disk to serve, e.g. `1` for `\\.\PhysicalDrive1` |
+| `--offset <bytes>` | partition start offset from `Get-Partition` |
+| `--size <bytes>` | partition size from `Get-Partition` |
+| `--port <n>` | TCP port, default 10809 |
+| `--bind <ip>` | address to listen on, default: the WSL adapter, else 127.0.0.1 |
+| `--no-xfs-patch` | serve XFS superblocks unmodified (patching is already off for ext4 and btrfs) |
+
+The server writes a log to `nbd_server.log` next to the exe.
 
 To go back to the stock WSL2 kernel, remove the `kernel=` line from `C:\Users\<you>\.wslconfig` and run `wsl --shutdown`.
 

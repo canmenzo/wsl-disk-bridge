@@ -5,11 +5,13 @@
 // Includes on-the-fly XFS feature patching for newer filesystems.
 //
 // Compile: csc /out:nbd_server.exe /platform:x64 /optimize+ nbd_server.cs
-// Run:     Start-Process .\nbd_server.exe -Verb RunAs
+// Run:     Start-Process .\nbd_server.exe -Verb RunAs -ArgumentList '--disk 1 --offset <bytes> --size <bytes>'
+//          (nbd_server.exe --help lists every option)
 
 using System;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -18,22 +20,26 @@ using Microsoft.Win32.SafeHandles;
 class NbdServer {
 
     // =====================================================================
-    // CONFIGURATION - Update these for your system
+    // CONFIGURATION - defaults, each one can be overridden on the command line
     // =====================================================================
 
-    // Physical disk path (use Get-Disk in PowerShell to find yours)
-    const string DISK = @"\\.\PhysicalDrive1";
+    // Physical disk path (use Get-Disk in PowerShell to find yours)        --disk
+    static string DISK = @"\\.\PhysicalDrive1";
 
-    // Partition byte offset and size (use Get-Partition -DiskNumber N to find)
-    const long PART_OFFSET = 2148532224L;
-    const long PART_SIZE   = 1998250384896L;
+    // Partition byte offset and size (Get-Partition -DiskNumber N)      --offset, --size
+    static long PART_OFFSET = 2148532224L;
+    static long PART_SIZE   = 1998250384896L;
 
-    // NBD server port (default NBD port)
-    const int PORT = 10809;
+    // NBD server port (default NBD port)                                   --port
+    static int PORT = 10809;
+
+    // Address to listen on. null = the WSL virtual adapter if there is one,
+    // otherwise 127.0.0.1. Never all interfaces unless asked for.          --bind
+    static IPAddress BIND = null;
 
     // XFS feature patching: set to true to patch incompatible XFS features
     // Only needed if your XFS uses features newer than WSL2's kernel supports
-    static bool patchXfsFeatures = true;
+    static bool patchXfsFeatures = true;                                 // --no-xfs-patch
 
     // =====================================================================
     // Win32 API imports for raw disk access
@@ -213,7 +219,59 @@ class NbdServer {
     // Main
     // =====================================================================
 
-    static void Main() {
+    const string USAGE =
+        "Usage: nbd_server.exe [options]\n" +
+        "  --disk <path|N>   disk to serve, e.g. 1 or \\\\.\\PhysicalDrive1\n" +
+        "  --offset <bytes>  partition start offset (Get-Partition shows it)\n" +
+        "  --size <bytes>    partition size\n" +
+        "  --port <n>        TCP port (default 10809)\n" +
+        "  --bind <ip>       address to listen on (default: the WSL adapter, else 127.0.0.1)\n" +
+        "  --no-xfs-patch    serve XFS superblocks unmodified\n" +
+        "Options left out keep the defaults at the top of nbd_server.cs.";
+
+    // Returns false when the program should exit (help shown or bad arguments).
+    static bool ParseArgs(string[] args) {
+        for (int i = 0; i < args.Length; i++) {
+            string a = args[i];
+            if (a == "--help" || a == "-h" || a == "/?") { Console.WriteLine(USAGE); return false; }
+            if (a == "--no-xfs-patch") { patchXfsFeatures = false; continue; }
+            if (i + 1 >= args.Length) { Console.Error.WriteLine("Missing value for " + a + "\n\n" + USAGE); return false; }
+            string v = args[++i];
+            long n;
+            IPAddress ip;
+            if (a == "--disk") {
+                DISK = long.TryParse(v, out n) ? @"\\.\PhysicalDrive" + n : v;
+            } else if (a == "--offset" && long.TryParse(v, out n) && n >= 0) {
+                PART_OFFSET = n;
+            } else if (a == "--size" && long.TryParse(v, out n) && n > 0) {
+                PART_SIZE = n;
+            } else if (a == "--port" && long.TryParse(v, out n) && n > 0 && n < 65536) {
+                PORT = (int)n;
+            } else if (a == "--bind" && IPAddress.TryParse(v, out ip)) {
+                BIND = ip;
+            } else {
+                Console.Error.WriteLine("Bad option or value: " + a + " " + v + "\n\n" + USAGE);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The Windows side of the WSL NAT network, e.g. "vEthernet (WSL)" or
+    // "vEthernet (WSL (Hyper-V firewall))". It only exists while WSL is running.
+    static IPAddress FindWslAdapterAddress() {
+        foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces()) {
+            if (nic.OperationalStatus != OperationalStatus.Up) continue;
+            if (nic.Name.IndexOf("WSL", StringComparison.OrdinalIgnoreCase) < 0) continue;
+            foreach (UnicastIPAddressInformation addr in nic.GetIPProperties().UnicastAddresses) {
+                if (addr.Address.AddressFamily == AddressFamily.InterNetwork) return addr.Address;
+            }
+        }
+        return null;
+    }
+
+    static void Main(string[] args) {
+        if (!ParseArgs(args)) return;
         try { Run(); }
         catch (Exception ex) {
             Console.Error.WriteLine("FATAL: " + ex);
@@ -243,8 +301,12 @@ class NbdServer {
         }
         Log("Disk opened successfully.");
 
-        // Detect filesystem and read XFS metadata if applicable
-        byte[] sb = DiskRead(0, 512);
+        // Detect filesystem and read XFS metadata if applicable. Read the raw bytes
+        // (no patching yet) and enough of them to reach the ext4 magic at 0x438.
+        bool patchRequested = patchXfsFeatures;
+        patchXfsFeatures = false;
+        byte[] sb = DiskRead(0, 4096);
+        patchXfsFeatures = patchRequested;
         string fsMagic = Encoding.ASCII.GetString(sb, 0, 4);
         if (fsMagic == "XFSB") {
             Log("Filesystem: XFS");
@@ -274,12 +336,22 @@ class NbdServer {
         }
         Log("");
 
-        // Start NBD server
-        TcpListener listener = new TcpListener(IPAddress.Any, PORT);
+        // Start NBD server. There is no authentication, so only listen where WSL can reach.
+        IPAddress bindAddr = BIND;
+        if (bindAddr == null) {
+            bindAddr = FindWslAdapterAddress();
+            if (bindAddr == null) {
+                bindAddr = IPAddress.Loopback;
+                Log("No WSL network adapter found, listening on 127.0.0.1 only.");
+                Log("  That works with WSL mirrored networking. With the default NAT networking,");
+                Log("  start WSL first and restart the server, or pass --bind <ip>.");
+            }
+        }
+        TcpListener listener = new TcpListener(bindAddr, PORT);
         listener.Start();
-        Log("NBD server listening on port " + PORT);
+        Log("NBD server listening on " + bindAddr + ":" + PORT);
         Log("Connect from WSL2 with:");
-        Log("  sudo nbd-client <WINDOWS_IP> " + PORT + " /dev/nbd0 -N '' -b 512");
+        Log("  sudo nbd-client -N export " + (IPAddress.IsLoopback(bindAddr) ? "127.0.0.1" : bindAddr.ToString()) + " " + PORT + " /dev/nbd0 -b 512");
         Log("");
 
         while (true) {
