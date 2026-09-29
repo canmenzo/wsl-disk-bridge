@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile with the csc.exe that ships with Windows
+        run: |
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /out:nbd_server.exe /platform:x64 /optimize+ nbd_server.cs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - run: .\nbd_server.exe --help
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Serve a file-backed disk and read it back over NBD
+        run: python tests/nbd_smoke.py nbd_server.exe
