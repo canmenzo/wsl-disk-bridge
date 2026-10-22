@@ -41,6 +41,10 @@ class NbdServer {
     // Only needed if your XFS uses features newer than WSL2's kernel supports
     static bool patchXfsFeatures = true;                                 // --no-xfs-patch
 
+    // Largest READ we serve and largest option payload we accept from a client
+    const uint MAX_READ = 32u << 20;
+    const uint MAX_OPTION_LEN = 4096;
+
     // =====================================================================
     // Win32 API imports for raw disk access
     // =====================================================================
@@ -346,6 +350,9 @@ class NbdServer {
                 Log("  That works with WSL mirrored networking. With the default NAT networking,");
                 Log("  start WSL first and restart the server, or pass --bind <ip>.");
             }
+        } else if (!IPAddress.IsLoopback(bindAddr) && !bindAddr.Equals(FindWslAdapterAddress())) {
+            Log("WARNING: " + bindAddr + " is not loopback or the WSL adapter. The server has no");
+            Log("  authentication, so anyone who can reach that address can read the whole partition.");
         }
         TcpListener listener = new TcpListener(bindAddr, PORT);
         listener.Start();
@@ -371,6 +378,8 @@ class NbdServer {
 
     static void HandleClient(TcpClient client) {
         NetworkStream ns = client.GetStream();
+        // Negotiation must finish promptly; a mounted export may then sit idle for hours.
+        client.ReceiveTimeout = 10000;
 
         // Newstyle NBD negotiation
         WriteBytes(ns, BE64(0x4e42444d41474943)); // NBDMAGIC
@@ -386,6 +395,7 @@ class NbdServer {
             byte[] hdr = ReadBytes(ns, 16);
             uint optId = ReadBE32(hdr, 8);
             uint optLen = ReadBE32(hdr, 12);
+            if (optLen > MAX_OPTION_LEN) throw new IOException("Option too long: " + optLen);
             if (optLen > 0) ReadBytes(ns, (int)optLen);
 
             if (optId == 1) { // NBD_OPT_EXPORT_NAME
@@ -413,6 +423,8 @@ class NbdServer {
             }
         }
 
+        client.ReceiveTimeout = 0;
+
         // Transmission phase
         long reads = 0, bytes = 0;
         while (true) {
@@ -424,7 +436,11 @@ class NbdServer {
             ulong offset = ReadBE64(req, 16);
             uint length = ReadBE32(req, 24);
 
-            if (cmd == 0) { // READ
+            if (cmd == 0 && (offset >= (ulong)PART_SIZE || length > MAX_READ || length > (ulong)PART_SIZE - offset)) {
+                WriteBytes(ns, BE32(0x67446698));
+                WriteBytes(ns, BE32(22)); // EINVAL: outside the partition or too large
+                WriteBytes(ns, BE64(handle));
+            } else if (cmd == 0) { // READ
                 reads++; bytes += length;
                 if (reads % 10000 == 0)
                     Log("  Progress: " + reads + " reads, " + (bytes / 1048576) + " MB served");

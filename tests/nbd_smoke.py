@@ -2,7 +2,8 @@
 
 Serves a random 8 MiB file with --offset/--size, then reads it back over NBD
 with both handshakes nbd-client uses (EXPORT_NAME and GO) and compares bytes.
-A second run stamps an ext4 superblock magic into the partition, leaves out
+Out-of-range and oversized reads must get EINVAL with no data, and an
+oversized option must end the session. A second run stamps an ext4 superblock magic into the partition, leaves out
 --bind, and checks filesystem detection and the loopback fallback.
 
     python tests/nbd_smoke.py path\\to\\nbd_server.exe
@@ -78,6 +79,31 @@ def read(s, handle, offset, length):
     return recv_exact(s, length)
 
 
+def read_rejected(s, handle, offset, length):
+    s.sendall(struct.pack(">IHHQQI", REQUEST_MAGIC, 0, 0, handle, offset, length))
+    magic, err, h = struct.unpack(">IIQ", recv_exact(s, 16))
+    assert (magic, err, h) == (SIMPLE_REPLY_MAGIC, 22, handle),         "read %d+%d not rejected" % (offset, length)
+
+
+def check_bounds():
+    s = connect()
+    handshake_export_name(s)
+    bad = [(SIZE, 512), (SIZE - 512, 1024), ((1 << 64) - 512, 1024),
+           (1 << 63, 512), (0, (32 << 20) + 1), (0, 0xFFFFFFFF)]
+    for i, (off, length) in enumerate(bad):
+        read_rejected(s, 100 + i, off, length)
+    # the session survives the rejections and still serves valid reads
+    assert len(read(s, 200, SIZE - 512, 512)) == 512
+    s.close()
+
+    s = connect()
+    s.sendall(struct.pack(">QII", IHAVEOPT, 1, 0x7FFFFFFF))
+    s.settimeout(10)
+    assert s.recv(1) == b"", "oversized option did not end the session"
+    s.close()
+    print("bounds: %d bad reads rejected, oversized option refused" % len(bad))
+
+
 def serve_and_check(disk, extra_args):
     image = os.path.abspath("test_disk.img")
     with open(image, "wb") as f:
@@ -101,6 +127,7 @@ def serve_and_check(disk, extra_args):
             s.sendall(struct.pack(">IHHQQI", REQUEST_MAGIC, 0, 2, 99, 0, 0))  # disconnect
             s.close()
             print("%s handshake: size ok, read-only, %d reads match" % (name, len(cases)))
+        check_bounds()
     finally:
         server.kill()
         out = server.communicate()[0].decode(errors="replace")
