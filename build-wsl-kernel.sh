@@ -28,6 +28,10 @@ JOBS="$(nproc)"
 WIN_USER="${WIN_USER:-$(ls /mnt/c/Users/ | grep -v -E 'Public|Default|All Users|Default User' | head -1)}"
 KERNEL_OUTPUT="/mnt/c/Users/${WIN_USER}/wsl-kernel-${KERNEL_VERSION}"
 WSLCONFIG="/mnt/c/Users/${WIN_USER}/.wslconfig"
+# kernel.org signs sha256sums.asc with the "Kernel.org checksum autosigner" key
+KERNEL_SIGNER_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
+# microsoft/WSL2-Linux-Kernel linux-msft-wsl-6.6.y, pinned so the config can't change under us
+WSL_CONFIG_COMMIT="a07f9ea8a99139913acbcc1c160b132cb2a49c81"
 
 echo "=== WSL Disk Bridge - Kernel Builder ==="
 echo "Kernel version:  ${KERNEL_VERSION}"
@@ -48,11 +52,11 @@ if command -v apt-get &>/dev/null; then
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         build-essential flex bison libssl-dev libelf-dev bc dwarves \
-        python3 cpio curl 2>&1 | tail -1
+        python3 cpio curl gnupg 2>&1 | tail -1
 elif command -v pacman &>/dev/null; then
-    pacman -Sy --noconfirm --needed base-devel flex bison openssl libelf bc pahole python cpio curl
+    pacman -Sy --noconfirm --needed base-devel flex bison openssl libelf bc pahole python cpio curl gnupg
 elif command -v dnf &>/dev/null; then
-    dnf install -y gcc make flex bison openssl-devel elfutils-libelf-devel bc dwarves python3 cpio curl
+    dnf install -y gcc make flex bison openssl-devel elfutils-libelf-devel bc dwarves python3 cpio curl gnupg2
 else
     echo "WARNING: Unknown package manager. Ensure build deps are installed."
 fi
@@ -65,8 +69,33 @@ if [ -d "${SOURCE}" ]; then
     echo "[2/6] Kernel source already exists at ${SOURCE}, skipping download."
 else
     echo "[2/6] Downloading Linux ${KERNEL_VERSION}..."
-    curl -L "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz" \
+    curl -fL --proto '=https' "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz" \
         -o "${TARBALL}"
+
+    echo "      Verifying against kernel.org's signed sha256sums.asc..."
+    GNUPGHOME="$(mktemp -d)"
+    export GNUPGHOME
+    SUMS="${GNUPGHOME}/sha256sums.asc"
+    curl -fsSL --proto '=https' "https://git.kernel.org/pub/scm/docs/kernel/pgpkeys.git/plain/keys/${KERNEL_SIGNER_FPR: -16}.asc" \
+        | gpg --batch --quiet --import
+    curl -fsSL --proto '=https' "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/sha256sums.asc" -o "${SUMS}"
+    if ! gpg --batch --status-fd 1 --verify "${SUMS}" 2>/dev/null | grep "^\[GNUPG:\] VALIDSIG .* ${KERNEL_SIGNER_FPR}\$" >/dev/null; then
+        echo "ERROR: sha256sums.asc is not signed by ${KERNEL_SIGNER_FPR}"
+        exit 1
+    fi
+    EXPECTED="$(gpg --batch --decrypt "${SUMS}" 2>/dev/null | awk -v f="linux-${KERNEL_VERSION}.tar.xz" '$2 == f { print $1 }')"
+    if [ -z "${EXPECTED}" ]; then
+        echo "ERROR: linux-${KERNEL_VERSION}.tar.xz is not listed in sha256sums.asc"
+        exit 1
+    fi
+    if ! echo "${EXPECTED}  ${TARBALL}" | sha256sum -c --quiet -; then
+        echo "ERROR: checksum mismatch for ${TARBALL}"
+        rm -f "${TARBALL}"
+        exit 1
+    fi
+    rm -rf "${GNUPGHOME}"
+    unset GNUPGHOME
+
     echo "      Extracting..."
     tar xf "${TARBALL}" -C "${BUILD_DIR}"
     rm -f "${TARBALL}"
@@ -76,7 +105,7 @@ cd "${SOURCE}"
 
 # --- Get Microsoft WSL2 config ---
 echo "[3/6] Downloading Microsoft WSL2 kernel config..."
-curl -sL "https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.y/arch/x86/configs/config-wsl" \
+curl -fsSL --proto '=https' "https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/${WSL_CONFIG_COMMIT}/arch/x86/configs/config-wsl" \
     -o .config
 
 # Adapt config to the newer kernel version

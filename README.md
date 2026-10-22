@@ -125,7 +125,7 @@ To go back to the stock WSL2 kernel, remove the `kernel=` line from `C:\Users\<y
 
 **XFS superblock patching.** Reads that cover any AG superblock have `features_incompat` bits 0x40 (EXCHRANGE) and 0x80 (PARENT) cleared and the CRC32C recomputed, so the stock kernel's validation passes. The disk itself is never touched. This gets the filesystem mounted, but directory access still fails when inodes carry parent pointer xattrs. For those filesystems you need the custom kernel.
 
-**Custom kernel script.** Downloads Linux 6.12 LTS from kernel.org, applies Microsoft's WSL2 config (`linux-msft-wsl-6.6.y`), runs `make olddefconfig`, enforces `XFS_FS=y`, `BTRFS_FS=m`, `BLK_DEV_NBD=m`, `HYPERV=y`, builds `bzImage` and modules, copies the kernel to `C:\Users\<you>\wsl-kernel-<version>` and sets `kernel=` in `.wslconfig`. Supports apt, pacman and dnf for build dependencies.
+**Custom kernel script.** Downloads Linux 6.12 LTS from kernel.org and checks it against kernel.org's GPG-signed `sha256sums.asc` (signer fingerprint pinned in the script), applies Microsoft's WSL2 config (`linux-msft-wsl-6.6.y`, pinned to a commit), runs `make olddefconfig`, enforces `XFS_FS=y`, `BTRFS_FS=m`, `BLK_DEV_NBD=m`, `HYPERV=y`, builds `bzImage` and modules, copies the kernel to `C:\Users\<you>\wsl-kernel-<version>` and sets `kernel=` in `.wslconfig`. Supports apt, pacman and dnf for build dependencies.
 
 | Feature | Stock 6.6.x | Custom 6.12.x |
 |---|---|---|
